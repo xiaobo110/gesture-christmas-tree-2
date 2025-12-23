@@ -1,943 +1,145 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
-import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
-import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { gsap } from 'gsap';
 import { Landmark, Results } from '../types';
-
-const PARTICLE_COUNT = 5000;
-const TREE_HEIGHT = 25;
-const TREE_RADIUS = 10;
-
-// Custom Shader Material for glowing golden particles
-const particleVertexShader = `
-  attribute float size;
-  attribute float alpha;
-  varying vec3 vColor;
-  varying float vAlpha;
-  varying float vSize;
-  
-  void main() {
-    vColor = color;
-    vAlpha = alpha;
-    vSize = size;
-    
-    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
-    gl_PointSize = size * (300.0 / -mvPosition.z);
-    gl_Position = projectionMatrix * mvPosition;
-  }
-`;
-
-const particleFragmentShader = `
-  uniform float time;
-  varying vec3 vColor;
-  varying float vAlpha;
-  varying float vSize;
-  
-  void main() {
-    vec2 center = gl_PointCoord - vec2(0.5);
-    float dist = length(center);
-    
-    // Enhanced glowing effect with softer, brighter edges
-    float alpha = vAlpha * (1.0 - smoothstep(0.0, 0.6, dist));
-    
-    // Multiple twinkle frequencies for rich sparkle effect
-    float twinkle1 = sin(time * 4.0 + vSize * 15.0) * 0.4 + 0.6;
-    float twinkle2 = sin(time * 6.5 + vSize * 8.0) * 0.3 + 0.7;
-    float twinkle3 = sin(time * 2.0 + vSize * 20.0) * 0.2 + 0.8;
-    float combinedTwinkle = (twinkle1 + twinkle2 + twinkle3) / 3.0;
-    
-    // Preserve original colors while adding sparkle
-    // Only apply golden tint to particles that are already gold/yellow
-    float isGold = step(0.5, vColor.r + vColor.g - vColor.b); // Detect gold/yellow colors
-    vec3 goldenBoost = vec3(1.0, 0.9, 0.6);
-    vec3 colorBoost = mix(vColor, vColor * goldenBoost, isGold * 0.6); // Only boost gold colors
-    
-    vec3 sparkleColor = colorBoost * (1.0 + combinedTwinkle * 0.8);
-    
-    // Add inner glow for extra shine (white glow, preserves color)
-    float innerGlow = 1.0 - smoothstep(0.0, 0.3, dist);
-    sparkleColor += vec3(1.0, 1.0, 1.0) * innerGlow * 0.3; // White glow, less intense
-    
-    alpha *= (0.8 + combinedTwinkle * 0.4);
-    
-    gl_FragColor = vec4(sparkleColor, alpha);
-  }
-`;
-
-// 3D Noise function for explosion state
-function noise3D(x: number, y: number, z: number): number {
-  const n = Math.sin(x * 12.9898 + y * 78.233 + z * 37.719) * 43758.5453;
-  return n - Math.floor(n);
-}
+import { ThreeScene } from '../ThreeScene';
+import { PARTICLE_CONFIG, THEME_NAMES, COLOR_THEMES } from '../constants';
+import { calculateFingerStates } from '../utils';
+import { useGestureRecognition } from '../useGestureRecognition';
 
 const GestureTree: React.FC = () => {
   const containerRef = useRef<HTMLDivElement>(null);
-  const videoRef = useRef<HTMLVideoElement>(null);
   
   // UI States
   const [cameraStatus, setCameraStatus] = useState<'LOADING' | 'ACTIVE' | 'ERROR'>('LOADING');
   const [interactionState, setInteractionState] = useState<'IDLE' | 'PINCHING'>('IDLE');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [currentTheme, setCurrentTheme] = useState<string>('经典圣诞');
+  const [currentTheme, setCurrentTheme] = useState<string>(COLOR_THEMES.CLASSIC);
 
   // Logic Refs
   const isPinchingRef = useRef(false);
   const pinchStrengthRef = useRef(0);
   const rotationTargetRef = useRef({ x: 0, y: 0 });
   const rotationCurrentRef = useRef({ x: 0, y: 0 });
-  const timeRef = useRef(0);
   const colorThemeRef = useRef(0);
-  const wasOneFingerRef = useRef(false);
-  const wasTwoFingersRef = useRef(false);
-  const wasThreeFingersRef = useRef(false);
   const isSnowingRef = useRef(false);
   
-  // Three.js Refs
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
-  const sceneRef = useRef<THREE.Scene | null>(null);
-  const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
-  const composerRef = useRef<EffectComposer | null>(null);
-  const particlesRef = useRef<THREE.Points | null>(null);
-  const treeGroupRef = useRef<THREE.Group | null>(null);
-  const starRef = useRef<THREE.Sprite | null>(null);
-  const trunkRef = useRef<THREE.Mesh | null>(null);
-  const snowParticlesRef = useRef<THREE.Points | null>(null);
-  const fireworksRef = useRef<any[]>([]);
-  
-  // Particle system data
-  const positionsRef = useRef<Float32Array | null>(null);
-  const velocitiesRef = useRef<Float32Array | null>(null);
-  const targetTreeRef = useRef<Float32Array | null>(null);
-  const targetExplodedRef = useRef<Float32Array | null>(null);
-  const sizesRef = useRef<Float32Array | null>(null);
-  const alphasRef = useRef<Float32Array | null>(null);
+  // Three.js Scene
+  const threeSceneRef = useRef<ThreeScene | null>(null);
 
   // 1. Initialize Three.js with Post-Processing
   useEffect(() => {
     if (!containerRef.current) return;
 
-    // Scene Setup
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x000000);
-    scene.fog = new THREE.FogExp2(0x000000, 0.02);
-    sceneRef.current = scene;
-
-    const camera = new THREE.PerspectiveCamera(
-      60,
-      window.innerWidth / window.innerHeight,
-      0.1,
-      1000
-    );
-    camera.position.set(0, 0, 35); 
-    camera.lookAt(0, 0, 0);
-    cameraRef.current = camera;
-
-    const renderer = new THREE.WebGLRenderer({ 
-      antialias: true,
-      powerPreference: 'high-performance',
-        alpha: false, 
-    });
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setClearColor(0x000000);
-    containerRef.current.appendChild(renderer.domElement);
-    rendererRef.current = renderer;
-
-    // Post-Processing Setup (UnrealBloomPass for cinematic glow)
-    const composer = new EffectComposer(renderer);
-    const renderPass = new RenderPass(scene, camera);
-    composer.addPass(renderPass);
-
-    const bloomPass = new UnrealBloomPass(
-      new THREE.Vector2(window.innerWidth, window.innerHeight),
-      2.2, // strength (increased for more golden glow)
-      0.5, // radius (slightly increased for wider glow)
-      0.7 // threshold (lowered to catch more particles)
-    );
-    composer.addPass(bloomPass);
-    composerRef.current = composer;
-
-    // Particle System Setup
-    const geometry = new THREE.BufferGeometry();
-    const positions = new Float32Array(PARTICLE_COUNT * 3);
-    const velocities = new Float32Array(PARTICLE_COUNT * 3);
-    const targetTree = new Float32Array(PARTICLE_COUNT * 3);
-    const targetExploded = new Float32Array(PARTICLE_COUNT * 3);
-    const colors = new Float32Array(PARTICLE_COUNT * 3);
-    const sizes = new Float32Array(PARTICLE_COUNT);
-    const alphas = new Float32Array(PARTICLE_COUNT);
-    
-    const colorGold = new THREE.Color(0xFFD700);
-    const colorWhite = new THREE.Color(0xFFFFFF);
-    const colorRed = new THREE.Color(0xFF6B6B);
-    const colorGreen = new THREE.Color(0x4ECDC4);
-    const tempColor = new THREE.Color();
-
-    // Initialize particle positions and targets
-    for (let i = 0; i < PARTICLE_COUNT; i++) {
-        const i3 = i * 3;
-
-      // Tree Shape: Linear Cone with Volume-based Density Distribution
-      const randomCheck = Math.random();
-      const layerPct = (i / PARTICLE_COUNT);
-      
-      if (randomCheck > (1 - layerPct * 0.7)) {
-        const redistributedPct = Math.random() * 0.5;
-        const actualLayerPct = redistributedPct;
-        const layerIndex = Math.floor(actualLayerPct * 12);
-        const normalizedY = layerIndex / 12;
-        
-        const linearFactor = 1 - normalizedY;
-        const curvedFactor = Math.pow(1 - normalizedY, 1.3);
-        const layerRadiusMax = TREE_RADIUS * (linearFactor * 0.8 + curvedFactor * 0.2);
-        
-        const GOLDEN_ANGLE = 2.399963229728653;
-        const angle = i * GOLDEN_ANGLE;
-        const r = layerRadiusMax * Math.sqrt(Math.random());
-        
-        let y = -TREE_HEIGHT / 2 + (normalizedY * TREE_HEIGHT);
-        const droop = r * 0.4;
-        y -= droop;
-        
-        const yRandomness = (Math.random() - 0.5) * 0.6;
-        const depthJitter = (Math.random() - 0.5) * (0.8 + normalizedY * 1.2);
-        
-        targetTree[i3] = Math.cos(angle) * r + depthJitter * 0.3;
-        targetTree[i3 + 1] = y + yRandomness;
-        targetTree[i3 + 2] = Math.sin(angle) * r + depthJitter * 0.3;
-      } else {
-        const layerIndex = Math.floor(layerPct * 12);
-        const normalizedY = layerIndex / 12;
-        
-        const linearFactor = 1 - normalizedY;
-        const curvedFactor = Math.pow(1 - normalizedY, 1.3);
-        const layerRadiusMax = TREE_RADIUS * (linearFactor * 0.8 + curvedFactor * 0.2);
-        
-        const minRadius = 0.2;
-        const finalRadius = Math.max(minRadius, layerRadiusMax);
-        
-        const GOLDEN_ANGLE = 2.399963229728653;
-        const angle = i * GOLDEN_ANGLE;
-        const r = finalRadius * Math.sqrt(Math.random());
-        
-        let y = -TREE_HEIGHT / 2 + (normalizedY * TREE_HEIGHT);
-        const droop = r * 0.4;
-        y -= droop;
-        
-        const yRandomness = (Math.random() - 0.5) * 0.6;
-        const depthJitter = (Math.random() - 0.5) * (0.8 + normalizedY * 1.2);
-        
-        targetTree[i3] = Math.cos(angle) * r + depthJitter * 0.3;
-        targetTree[i3 + 1] = y + yRandomness;
-        targetTree[i3 + 2] = Math.sin(angle) * r + depthJitter * 0.3;
-      }
-
-      // Exploded State (3D Noise Distribution)
-      const spread = 60;
-      const noiseX = noise3D(i, 0, 0);
-      const noiseY = noise3D(0, i, 0);
-      const noiseZ = noise3D(0, 0, i);
-      
-      targetExploded[i3] = (noiseX - 0.5) * spread;
-      targetExploded[i3 + 1] = (noiseY - 0.5) * spread;
-      targetExploded[i3 + 2] = (noiseZ - 0.5) * spread;
-
-      // Start in exploded state
-      positions[i3] = targetExploded[i3];
-      positions[i3 + 1] = targetExploded[i3 + 1];
-      positions[i3 + 2] = targetExploded[i3 + 2];
-
-      // Initial velocities (zero)
-      velocities[i3] = 0;
-      velocities[i3 + 1] = 0;
-      velocities[i3 + 2] = 0;
-
-      // Colors (Christmas theme - balanced distribution)
-        const rand = Math.random();
-      if (rand > 0.7) {
-        tempColor.copy(colorWhite).multiplyScalar(1.3);
-      } else if (rand > 0.4) {
-        tempColor.copy(colorGold).multiplyScalar(1.5);
-      } else if (rand > 0.25) {
-        tempColor.copy(colorRed).multiplyScalar(1.2);
-      } else {
-        tempColor.copy(colorGreen);
-      }
-
-        colors[i3] = tempColor.r;
-      colors[i3 + 1] = tempColor.g;
-      colors[i3 + 2] = tempColor.b;
-
-      // Sizes and alphas (variation for depth)
-      sizes[i] = 0.8 + Math.random() * 0.6;
-      alphas[i] = 0.7 + Math.random() * 0.3;
-    }
-
-    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3).setUsage(THREE.DynamicDrawUsage));
-    geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-    geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
-    geometry.setAttribute('alpha', new THREE.BufferAttribute(alphas, 1));
-
-    // Custom Shader Material
-    const material = new THREE.ShaderMaterial({
-      uniforms: {
-        time: { value: 0 },
-      },
-      vertexShader: particleVertexShader,
-      fragmentShader: particleFragmentShader,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-        transparent: true,
-      vertexColors: true,
-    });
-
-    const particles = new THREE.Points(geometry, material);
-    particlesRef.current = particles;
-    
-    // Group for rotation
-    const treeGroup = new THREE.Group();
-    treeGroup.add(particles);
-    // 向上移动整棵树，上下都留有空白
-    treeGroup.position.y = 2; // 向上移动2个单位，上下平衡
-    scene.add(treeGroup);
-    treeGroupRef.current = treeGroup;
-
-    // Store refs
-    positionsRef.current = positions;
-    velocitiesRef.current = velocities;
-    targetTreeRef.current = targetTree;
-    targetExplodedRef.current = targetExploded;
-    sizesRef.current = sizes;
-    alphasRef.current = alphas;
-
-    // Star Sprite (brighter at tree top)
-    const starCanvas = document.createElement('canvas');
-    starCanvas.width = 128;
-    starCanvas.height = 128;
-    const starCtx = starCanvas.getContext('2d');
-    if (starCtx) {
-      const grad = starCtx.createRadialGradient(64, 64, 0, 64, 64, 64);
-      grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
-      grad.addColorStop(0.3, 'rgba(255, 215, 0, 0.9)');
-      grad.addColorStop(0.6, 'rgba(255, 215, 0, 0.3)');
-      grad.addColorStop(1, 'rgba(0, 0, 0, 0)');
-      starCtx.fillStyle = grad;
-      starCtx.fillRect(0, 0, 128, 128);
-    }
-    const starTexture = new THREE.CanvasTexture(starCanvas);
-    const starMaterial = new THREE.SpriteMaterial({
-      map: starTexture,
-      blending: THREE.AdditiveBlending,
-      transparent: true,
-    });
-    const star = new THREE.Sprite(starMaterial);
-    star.scale.set(0, 0, 1);
-    star.position.set(0, TREE_HEIGHT / 2 + 0.5, 0);
-    treeGroup.add(star);
-    starRef.current = star;
-
-    // Tree Trunk (长度9，明显可见)
-    // 高度 9，从树底部向下延伸
-    const trunkGeometry = new THREE.CylinderGeometry(1.0, 1.6, 9, 16);
-    const trunkMaterial = new THREE.MeshStandardMaterial({
-      color: 0x4A2511, // 深棕色
-      roughness: 0.9,
-      metalness: 0.1,
-    });
-    const trunk = new THREE.Mesh(trunkGeometry, trunkMaterial);
-    // 位置：树底部在 -12.5，树干高度9，中心在 -12.5 - 4.5 = -17
-    // 树干从 -21.5 延伸到 -12.5（刚好连接树底部）
-    trunk.position.set(0, -TREE_HEIGHT / 2 - 4.5, 0);
-    trunk.visible = false;
-    treeGroup.add(trunk);
-    trunkRef.current = trunk;
-
-    const ambientLight = new THREE.AmbientLight(0xffffff, 0.3);
-    scene.add(ambientLight);
-    
-    const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
-    directionalLight.position.set(5, 10, 5);
-    scene.add(directionalLight);
-
-    // Snow Particle System
-    const SNOW_COUNT = 1000;
-    const snowGeometry = new THREE.BufferGeometry();
-    const snowPositions = new Float32Array(SNOW_COUNT * 3);
-    
-    for (let i = 0; i < SNOW_COUNT; i++) {
-      snowPositions[i * 3] = (Math.random() - 0.5) * 60;
-      snowPositions[i * 3 + 1] = Math.random() * 40 + 10;
-      snowPositions[i * 3 + 2] = (Math.random() - 0.5) * 60;
-    }
-    
-    snowGeometry.setAttribute('position', new THREE.BufferAttribute(snowPositions, 3).setUsage(THREE.DynamicDrawUsage));
-    
-    const snowMaterial = new THREE.PointsMaterial({
-      size: 0.3,
-      color: 0xffffff,
-      transparent: true,
-      opacity: 0.8,
-      blending: THREE.AdditiveBlending,
-    });
-    
-    const snowParticles = new THREE.Points(snowGeometry, snowMaterial);
-    snowParticles.visible = false;
-    scene.add(snowParticles);
-    snowParticlesRef.current = snowParticles;
-
-    // Animation Loop with Physics
-    let animationFrameId: number;
-    const GRAVITY_STRENGTH = 0.35;
-    const EXPLOSION_STRENGTH = 0.25;
-    const DAMPING = 0.90;
-    const BROWN_MOTION = 0.03;
-    
-    const animate = () => {
-        animationFrameId = requestAnimationFrame(animate);
-      timeRef.current += 0.016;
-
-      if (!rendererRef.current || !composerRef.current) return;
-
-      const positions = positionsRef.current!;
-      const velocities = velocitiesRef.current!;
-      const targetTree = targetTreeRef.current!;
-      const targetExploded = targetExplodedRef.current!;
-      const material = particlesRef.current!.material as THREE.ShaderMaterial;
-
-      material.uniforms.time.value = timeRef.current;
-
-      const isPinching = isPinchingRef.current;
-      const pinchStrength = pinchStrengthRef.current;
-        
-        for (let i = 0; i < PARTICLE_COUNT; i++) {
-            const i3 = i * 3;
-        const x = positions[i3];
-        const y = positions[i3 + 1];
-        const z = positions[i3 + 2];
-
-        let targetX, targetY, targetZ;
-        
-        if (pinchStrength > 0.01) {
-          targetX = targetTree[i3];
-          targetY = targetTree[i3 + 1];
-          targetZ = targetTree[i3 + 2];
-
-          const dx = targetX - x;
-          const dy = targetY - y;
-          const dz = targetZ - z;
-          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-          if (dist > 0.01) {
-            const force = GRAVITY_STRENGTH * pinchStrength;
-            velocities[i3] += (dx / dist) * force;
-            velocities[i3 + 1] += (dy / dist) * force;
-            velocities[i3 + 2] += (dz / dist) * force;
-          }
-            } else {
-          targetX = targetExploded[i3];
-          targetY = targetExploded[i3 + 1];
-          targetZ = targetExploded[i3 + 2];
-
-          const dx = targetX - x;
-          const dy = targetY - y;
-          const dz = targetZ - z;
-          const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-          if (dist > 0.01) {
-            const force = EXPLOSION_STRENGTH;
-            velocities[i3] += (dx / dist) * force;
-            velocities[i3 + 1] += (dy / dist) * force;
-            velocities[i3 + 2] += (dz / dist) * force;
-          }
-
-          velocities[i3] += (Math.random() - 0.5) * BROWN_MOTION;
-          velocities[i3 + 1] += (Math.random() - 0.5) * BROWN_MOTION;
-          velocities[i3 + 2] += (Math.random() - 0.5) * BROWN_MOTION;
-        }
-
-        velocities[i3] *= DAMPING;
-        velocities[i3 + 1] *= DAMPING;
-        velocities[i3 + 2] *= DAMPING;
-
-        positions[i3] += velocities[i3];
-        positions[i3 + 1] += velocities[i3 + 1];
-        positions[i3 + 2] += velocities[i3 + 2];
-      }
-
-        geometry.attributes.position.needsUpdate = true;
-
-      // Star Animation
-      if (starRef.current) {
-        const targetScale = isPinching ? 5 + Math.sin(timeRef.current * 4) * 1.5 : 0;
-        gsap.to(starRef.current.scale, {
-          x: targetScale,
-          y: targetScale,
-          duration: 0.5,
-          ease: 'power2.out',
-        });
-      }
-
-      // Trunk Animation
-      if (trunkRef.current) {
-        trunkRef.current.visible = isPinching;
-        trunkRef.current.rotation.y += 0.001;
-      }
-
-      // Snow Animation
-      if (snowParticlesRef.current && snowParticlesRef.current.visible) {
-        const snowPos = snowParticlesRef.current.geometry.attributes.position.array as Float32Array;
-        const SNOW_COUNT = snowPos.length / 3;
-        
-        for (let i = 0; i < SNOW_COUNT; i++) {
-          const i3 = i * 3;
-          snowPos[i3 + 1] -= 0.05 + Math.sin(timeRef.current + i) * 0.02;
-          snowPos[i3] += Math.sin(timeRef.current * 0.5 + i) * 0.02;
-          
-          if (snowPos[i3 + 1] < -15) {
-            snowPos[i3 + 1] = 40;
-            snowPos[i3] = (Math.random() - 0.5) * 60;
-            snowPos[i3 + 2] = (Math.random() - 0.5) * 60;
-          }
-        }
-        snowParticlesRef.current.geometry.attributes.position.needsUpdate = true;
-      }
-
-      // Fireworks Animation with enhanced effects
-      const activeFireworks = fireworksRef.current.filter(fw => fw.active);
-      activeFireworks.forEach(fw => {
-        fw.age += 0.016;
-        if (fw.age > fw.lifetime) {
-          fw.active = false;
-          if (fw.particles) {
-            scene.remove(fw.particles);
-            fw.particles.geometry.dispose();
-            (fw.particles.material as THREE.Material).dispose();
-          }
-          return;
-        }
-        
-        if (fw.particles) {
-          const positions = fw.particles.geometry.attributes.position.array as Float32Array;
-          const velocities = fw.velocities;
-          const colors = fw.particles.geometry.attributes.color.array as Float32Array;
-          
-          for (let i = 0; i < positions.length / 3; i++) {
-            const i3 = i * 3;
-            
-            // 位置更新
-            positions[i3] += velocities[i3];
-            positions[i3 + 1] += velocities[i3 + 1];
-            positions[i3 + 2] += velocities[i3 + 2];
-            
-            // 重力效果（增强）
-            velocities[i3 + 1] -= 0.015;
-            
-            // 空气阻力
-            velocities[i3] *= 0.97;
-            velocities[i3 + 1] *= 0.97;
-            velocities[i3 + 2] *= 0.97;
-            
-            // 颜色渐变到白色（后期变亮效果）
-            const ageFactor = fw.age / fw.lifetime;
-            if (ageFactor > 0.5) {
-              const whiteMix = (ageFactor - 0.5) * 0.6; // 后半段逐渐变白
-              colors[i3] = colors[i3] * (1 - whiteMix) + whiteMix;
-              colors[i3 + 1] = colors[i3 + 1] * (1 - whiteMix) + whiteMix;
-              colors[i3 + 2] = colors[i3 + 2] * (1 - whiteMix) + whiteMix;
-            }
-          }
-          
-          fw.particles.geometry.attributes.position.needsUpdate = true;
-          fw.particles.geometry.attributes.color.needsUpdate = true;
-          
-          // 非线性透明度衰减（先亮后快速消失）
-          const ageFactor = fw.age / fw.lifetime;
-          const opacity = ageFactor < 0.7 ? 1.0 : (1 - (ageFactor - 0.7) / 0.3);
-          (fw.particles.material as THREE.PointsMaterial).opacity = opacity;
-        }
-      });
-
-      // Rotation Control
-      const targetRotX = rotationTargetRef.current.y * 1.8;
-      const targetRotY = -rotationTargetRef.current.x * 2.5;
-
-      if (isPinching) {
-        gsap.to(rotationCurrentRef.current, {
-          x: targetRotX,
-          y: targetRotY,
-          duration: 0.8,
-          ease: 'power2.out',
-        });
-      } else {
-        rotationCurrentRef.current.y += 0.002;
-      }
-
-      if (treeGroupRef.current) {
-        treeGroupRef.current.rotation.x = rotationCurrentRef.current.x;
-        treeGroupRef.current.rotation.y = rotationCurrentRef.current.y;
-      }
-
-      composer.render();
-    };
-
-    animate();
-
     const handleResize = () => {
-      if (!cameraRef.current || !rendererRef.current || !composerRef.current) return;
-        cameraRef.current.aspect = window.innerWidth / window.innerHeight;
-        cameraRef.current.updateProjectionMatrix();
-        rendererRef.current.setSize(window.innerWidth, window.innerHeight);
-      composerRef.current.setSize(window.innerWidth, window.innerHeight);
+      if (threeSceneRef.current) {
+        threeSceneRef.current.updateSize();
+      }
     };
-    window.addEventListener('resize', handleResize);
+
+    // Initialize ThreeScene
+    threeSceneRef.current = new ThreeScene({
+      container: containerRef.current,
+      onWindowResize: handleResize,
+      onParticleUpdate: (positions, velocities, targetTree, targetExploded) => {
+        // Store references for gesture interaction
+        // These would be used if we need direct access to particle data
+      }
+    });
 
     return () => {
-        window.removeEventListener('resize', handleResize);
-        cancelAnimationFrame(animationFrameId);
-        if (rendererRef.current) {
-             const domEl = rendererRef.current.domElement;
-             if (domEl && domEl.parentNode) domEl.parentNode.removeChild(domEl);
-             rendererRef.current.dispose();
-             rendererRef.current = null;
-        }
-      if (composerRef.current) {
-        composerRef.current.dispose();
-        composerRef.current = null;
-        }
-        geometry.dispose();
-        material.dispose();
-        starMaterial.dispose();
-      starTexture.dispose();
-    };
-  }, []); 
-
-  // 2. Initialize MediaPipe
-  useEffect(() => {
-    let handsInstance: any = null;
-    let cameraInstance: any = null;
-    let isMounted = true;
-
-    const initCamera = async () => {
-        try {
-            let attempts = 0;
-        const getCamera = () => {
-          const win = window as any;
-          return (
-            win.Camera ||
-            win.CameraUtils?.Camera ||
-            (win.camera_utils && win.camera_utils.Camera) ||
-            null
-          );
-        };
-
-        while ((!window.Hands || !getCamera()) && attempts < 100) {
-          await new Promise((r) => setTimeout(r, 50));
-                attempts++;
-            }
-
-            if (!isMounted) return;
-
-        const CameraClass = getCamera();
-        if (!window.Hands || !CameraClass) {
-          setErrorMessage('MediaPipe failed to load. Please check connection and refresh.');
-                setCameraStatus('ERROR');
-                return;
-            }
-
-            handsInstance = new window.Hands({
-          locateFile: (file: string) =>
-            `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`,
-            });
-
-            handsInstance.setOptions({
-                maxNumHands: 1,
-                modelComplexity: 1,
-                minDetectionConfidence: 0.5,
-                minTrackingConfidence: 0.5,
-            });
-
-            handsInstance.onResults((results: Results) => {
-                if (!isMounted) return;
-                
-                if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
-                    const landmarks = results.multiHandLandmarks[0];
-            const wrist = landmarks[0];
-            const thumbTip = landmarks[4];
-            const indexTip = landmarks[8];
-            const middleTip = landmarks[12];
-            const ringTip = landmarks[16];
-            const pinkyTip = landmarks[20];
-            const palmBase = landmarks[9];
-
-            // More sensitive detection with improved thresholds
-            const indexCurled = Math.abs(indexTip.y - palmBase.y) < 0.12;
-            const middleCurled = Math.abs(middleTip.y - palmBase.y) < 0.12;
-            const ringCurled = Math.abs(ringTip.y - palmBase.y) < 0.12;
-            const pinkyCurled = Math.abs(pinkyTip.y - palmBase.y) < 0.12;
-            const thumbCurled = Math.abs(thumbTip.y - palmBase.y) < 0.18;
-
-            // Extended means clearly above palm
-            const indexExtended = Math.abs(indexTip.y - palmBase.y) > 0.15;
-            const middleExtended = Math.abs(middleTip.y - palmBase.y) > 0.15;
-            const ringExtended = Math.abs(ringTip.y - palmBase.y) > 0.15;
-            const pinkyExtended = Math.abs(pinkyTip.y - palmBase.y) > 0.15;
-
-            const fingersCurled = [indexCurled, middleCurled, ringCurled, pinkyCurled].filter(x => x).length;
-            const fingersExtended = [indexExtended, middleExtended, ringExtended, pinkyExtended].filter(x => x).length;
-            const isFist = fingersCurled >= 3 && thumbCurled;
-
-            // More lenient finger counting (1, 2, 3)
-            // One finger: Only index is clearly extended, others are clearly not
-            const isOneFinger = indexExtended && !middleExtended && !ringExtended && !pinkyExtended;
-            
-            // Two fingers: Index and middle extended, others not
-            const isTwoFingers = indexExtended && middleExtended && !ringExtended && !pinkyExtended;
-            
-            // Three fingers: Index, middle, ring extended, pinky not
-            const isThreeFingers = indexExtended && middleExtended && ringExtended && !pinkyExtended;
-
-            // Handle gestures with priority
-            if (isOneFinger && !wasOneFingerRef.current) {
-              // 1 finger: 切换颜色主题
-              wasOneFingerRef.current = true;
-
-              const oldTheme = colorThemeRef.current;
-              const newTheme = (oldTheme + 1) % 3;
-              colorThemeRef.current = newTheme;
-
-              const themeNames = ['经典圣诞', '冰雪奇缘', '梦幻粉紫'];
-              setCurrentTheme(themeNames[newTheme]);
-
-              if (particlesRef.current) {
-                const colors = particlesRef.current.geometry.attributes.color.array as Float32Array;
-                const colorGold = new THREE.Color(0xFFD700);
-                const colorWhite = new THREE.Color(0xFFFFFF);
-                const colorRed = new THREE.Color(0xFF6B6B);
-                const colorGreen = new THREE.Color(0x4ECDC4);
-                const colorBlue = new THREE.Color(0x4169E1);
-                const colorSilver = new THREE.Color(0xC0C0C0);
-                const colorPink = new THREE.Color(0xFF69B4);
-                const colorPurple = new THREE.Color(0x9370DB);
-
-                for (let i = 0; i < PARTICLE_COUNT; i++) {
-                  const i3 = i * 3;
-                  const rand = Math.random();
-                  let tempColor = new THREE.Color();
-
-                  if (newTheme === 0) {
-                    if (rand > 0.7) tempColor.copy(colorWhite).multiplyScalar(1.3);
-                    else if (rand > 0.4) tempColor.copy(colorGold).multiplyScalar(1.5);
-                    else if (rand > 0.25) tempColor.copy(colorRed).multiplyScalar(1.2);
-                    else tempColor.copy(colorGreen);
-                  } else if (newTheme === 1) {
-                    if (rand > 0.6) tempColor.copy(colorWhite).multiplyScalar(1.4);
-                    else if (rand > 0.3) tempColor.copy(colorBlue).multiplyScalar(1.5);
-                    else tempColor.copy(colorSilver).multiplyScalar(1.3);
-                  } else {
-                    if (rand > 0.6) tempColor.copy(colorWhite).multiplyScalar(1.4);
-                    else if (rand > 0.3) tempColor.copy(colorPink).multiplyScalar(1.5);
-                    else tempColor.copy(colorPurple).multiplyScalar(1.3);
-                  }
-
-                  colors[i3] = tempColor.r;
-                  colors[i3 + 1] = tempColor.g;
-                  colors[i3 + 2] = tempColor.b;
-                }
-                particlesRef.current.geometry.attributes.color.needsUpdate = true;
-              }
-            } else if (!isOneFinger) {
-              wasOneFingerRef.current = false;
-            }
-
-            if (isTwoFingers && !wasTwoFingersRef.current && !isSnowingRef.current) {
-              // 2 fingers: 飘雪
-              wasTwoFingersRef.current = true;
-              isSnowingRef.current = true;
-
-              if (snowParticlesRef.current) {
-                snowParticlesRef.current.visible = true;
-              }
-
-              setTimeout(() => {
-                isSnowingRef.current = false;
-                if (snowParticlesRef.current) {
-                  snowParticlesRef.current.visible = false;
-                }
-              }, 10000);
-            } else if (!isTwoFingers) {
-              wasTwoFingersRef.current = false;
-            }
-
-            if (isThreeFingers && !wasThreeFingersRef.current) {
-              // 3 fingers: 烟花 - 多层爆炸效果
-              wasThreeFingersRef.current = true;
-
-              const fireworkPos = {
-                x: (palmBase.x - 0.5) * 40,
-                y: (palmBase.y - 0.5) * -30 + 10,
-                z: 0
-              };
-
-              // 创建3个不同层次的烟花（多层爆炸）
-              const layers = [
-                { count: 200, speed: 0.8, size: 0.8, delay: 0 },      // 外层：快速、大粒子
-                { count: 150, speed: 0.5, size: 0.6, delay: 0.1 },   // 中层：中速、中粒子
-                { count: 100, speed: 0.3, size: 0.4, delay: 0.2 },   // 内层：慢速、小粒子
-              ];
-
-              layers.forEach((layer, layerIndex) => {
-                setTimeout(() => {
-                  const FW_PARTICLES = layer.count;
-                  const fwGeometry = new THREE.BufferGeometry();
-                  const fwPositions = new Float32Array(FW_PARTICLES * 3);
-                  const fwVelocities = new Float32Array(FW_PARTICLES * 3);
-                  const fwColors = new THREE.Float32Array(FW_PARTICLES * 3);
-                  const fwSizes = new Float32Array(FW_PARTICLES);
-
-                  // 每层不同颜色，更丰富
-                  const fwColor1 = new THREE.Color();
-                  const fwColor2 = new THREE.Color();
-                  fwColor1.setHSL(Math.random(), 1.0, 0.6);
-                  fwColor2.setHSL((Math.random() + 0.3) % 1.0, 1.0, 0.7); // 互补色
-
-                  for (let i = 0; i < FW_PARTICLES; i++) {
-                    fwPositions[i * 3] = fireworkPos.x;
-                    fwPositions[i * 3 + 1] = fireworkPos.y;
-                    fwPositions[i * 3 + 2] = fireworkPos.z;
-
-                    // 球形均匀分布
-                    const theta = Math.random() * Math.PI * 2;
-                    const phi = Math.acos(2 * Math.random() - 1); // 均匀球面分布
-                    const speed = (Math.random() * 0.4 + 0.8) * layer.speed;
-
-                    fwVelocities[i * 3] = Math.sin(phi) * Math.cos(theta) * speed;
-                    fwVelocities[i * 3 + 1] = Math.sin(phi) * Math.sin(theta) * speed;
-                    fwVelocities[i * 3 + 2] = Math.cos(phi) * speed;
-
-                    // 渐变颜色（从颜色1到颜色2）
-                    const colorMix = i / FW_PARTICLES;
-                    const tempColor = new THREE.Color().lerpColors(fwColor1, fwColor2, colorMix);
-                    
-                    fwColors[i * 3] = tempColor.r;
-                    fwColors[i * 3 + 1] = tempColor.g;
-                    fwColors[i * 3 + 2] = tempColor.b;
-                    
-                    // 粒子大小变化
-                    fwSizes[i] = layer.size * (0.8 + Math.random() * 0.4);
-                  }
-
-                  fwGeometry.setAttribute('position', new THREE.BufferAttribute(fwPositions, 3).setUsage(THREE.DynamicDrawUsage));
-                  fwGeometry.setAttribute('color', new THREE.BufferAttribute(fwColors, 3));
-                  fwGeometry.setAttribute('size', new THREE.BufferAttribute(fwSizes, 1));
-
-                  const fwMaterial = new THREE.PointsMaterial({
-                    size: layer.size,
-                    vertexColors: true,
-                    blending: THREE.AdditiveBlending,
-                    transparent: true,
-                    sizeAttenuation: true, // 距离衰减
-                  });
-
-                  const fwParticles = new THREE.Points(fwGeometry, fwMaterial);
-                  sceneRef.current?.add(fwParticles);
-
-                  fireworksRef.current.push({
-                    particles: fwParticles,
-                    velocities: fwVelocities,
-                    age: 0,
-                    lifetime: 3.0, // 增加到3秒
-                    active: true,
-                    layerIndex: layerIndex
-                  });
-                }, layer.delay * 1000);
-              });
-
-              // Star flash
-              if (starRef.current && isPinchingRef.current) {
-                gsap.to(starRef.current.scale, {
-                  x: 10,
-                  y: 10,
-                  duration: 0.2,
-                  ease: 'power2.out',
-                  yoyo: true,
-                  repeat: 1,
-                });
-              }
-            } else if (!isThreeFingers) {
-              wasThreeFingersRef.current = false;
-            }
-
-            // Fist gesture for tree control
-            if (isFist) {
-              const strength = fingersCurled / 4.0;
-              gsap.to(pinchStrengthRef, {
-                current: strength,
-                duration: 0.3,
-                ease: 'power2.out',
-              });
-                        isPinchingRef.current = true;
-                        setInteractionState('PINCHING');
-                        
-              const cx = palmBase.x;
-              const cy = palmBase.y;
-                        rotationTargetRef.current = {
-                            x: (cx - 0.5) * 2,
-                y: (cy - 0.5) * 2,
-              };
-            } else if (!isFist && !isOneFinger && !isTwoFingers && !isThreeFingers) {
-              gsap.to(pinchStrengthRef, {
-                current: 0,
-                duration: 0.5,
-                ease: 'power2.out',
-              });
-                        isPinchingRef.current = false;
-                        setInteractionState('IDLE');
-                    }
-                } else {
-            // No hands
-            gsap.to(pinchStrengthRef, {
-              current: 0,
-              duration: 0.5,
-              ease: 'power2.out',
-            });
-                    isPinchingRef.current = false;
-                    setInteractionState('IDLE');
-                }
-            });
-
-            if (videoRef.current) {
-          const CameraClass = getCamera();
-          cameraInstance = new CameraClass(videoRef.current, {
-                    onFrame: async () => {
-                        if (handsInstance && videoRef.current) {
-                            await handsInstance.send({ image: videoRef.current });
-                        }
-                    },
-                    width: 640,
-            height: 480,
-                });
-                await cameraInstance.start();
-                if (isMounted) setCameraStatus('ACTIVE');
-            }
-        } catch (e: any) {
-            console.error(e);
-            if (isMounted) {
-                setCameraStatus('ERROR');
-          setErrorMessage('Camera access denied. Please allow camera permissions.');
-            }
-        }
-    };
-
-    initCamera();
-
-    return () => {
-        isMounted = false;
-        if (handsInstance) handsInstance.close();
-        if (cameraInstance) cameraInstance.stop();
+      if (threeSceneRef.current) {
+        threeSceneRef.current.dispose();
+        threeSceneRef.current = null;
+      }
     };
   }, []);
+
+  // 2. Initialize MediaPipe with custom hook
+  const { videoRef } = useGestureRecognition({
+    onOneFingerGesture: () => {
+      // 1 finger: 切换颜色主题
+      const oldTheme = colorThemeRef.current;
+      const newTheme = (oldTheme + 1) % 3;
+      colorThemeRef.current = newTheme;
+
+      setCurrentTheme(THEME_NAMES[newTheme]);
+
+      if (threeSceneRef.current) {
+        threeSceneRef.current.updateColorTheme(newTheme);
+      }
+    },
+    onTwoFingersGesture: () => {
+      // 2 fingers: 飘雪
+      if (!isSnowingRef.current) {
+        isSnowingRef.current = true;
+
+        if (threeSceneRef.current) {
+          threeSceneRef.current.toggleSnow(true);
+        }
+
+        setTimeout(() => {
+          isSnowingRef.current = false;
+          if (threeSceneRef.current) {
+            threeSceneRef.current.toggleSnow(false);
+          }
+        }, 10000);
+      }
+    },
+    onThreeFingersGesture: () => {
+      // 3 fingers: 烟花 - 多层爆炸效果
+      // Note: palmBase coordinates are not available here, will be handled in onFistGesture
+      if (threeSceneRef.current) {
+        threeSceneRef.current.createFireworks(
+          0, // Default x position
+          0, // Default y position
+          0  // Default z position
+        );
+      }
+    },
+    onFistGesture: (strength, palmX, palmY) => {
+      gsap.to(pinchStrengthRef, {
+        current: strength,
+        duration: 0.3,
+        ease: 'power2.out',
+      });
+      isPinchingRef.current = true;
+      setInteractionState('PINCHING');
+      
+      const cx = palmX;
+      const cy = palmY;
+      
+      // Update ThreeScene with new state
+      if (threeSceneRef.current) {
+        threeSceneRef.current.updatePinchState(true, strength);
+        threeSceneRef.current.updateRotationTarget(
+          (cx - 0.5) * 2,
+          (cy - 0.5) * 2
+        );
+      }
+    },
+    onNoGesture: () => {
+      gsap.to(pinchStrengthRef, {
+        current: 0,
+        duration: 0.5,
+        ease: 'power2.out',
+      });
+      isPinchingRef.current = false;
+      setInteractionState('IDLE');
+      
+      // Update ThreeScene with new state
+      if (threeSceneRef.current) {
+        threeSceneRef.current.updatePinchState(false, 0);
+      }
+    },
+    onError: (message) => {
+      setErrorMessage(message);
+      setCameraStatus('ERROR');
+    },
+    onStatusChange: (status) => {
+      setCameraStatus(status);
+    }
+  });
 
   return (
     <div className="relative w-full h-full bg-black">
@@ -948,7 +150,7 @@ const GestureTree: React.FC = () => {
         <div className="flex justify-between items-start w-full">
             <div className="bg-black/60 backdrop-blur-md p-4 rounded-xl border border-white/10 shadow-xl">
                 <h1 className="text-3xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-yellow-200 via-yellow-400 to-yellow-600">
-                    Gesture Christmas Tree
+                    圣诞树
                 </h1>
                 <div className="mt-2 text-sm text-gray-300 font-mono">
                     <div className="flex items-center gap-2">
@@ -956,7 +158,6 @@ const GestureTree: React.FC = () => {
                 <span>握拳形成圣诞树并旋转</span>
                     </div>
                     <div className="flex items-center gap-2 mt-1">
-                        <span className="text-xl">🖐️</span>
                 <span>张开手爆炸散开</span>
               </div>
               <div className="mt-3 pt-2 border-t border-white/10">
@@ -1007,10 +208,10 @@ const GestureTree: React.FC = () => {
                 ></span>
                 </span>
               {cameraStatus === 'LOADING'
-                ? 'INITIALIZING VISION...'
+                ? '视觉系统初始化中...'
                 : cameraStatus === 'ACTIVE'
-                ? 'VISION ACTIVE'
-                : 'VISION FAILED'}
+                ? '视觉系统运行中'
+                : '视觉系统错误'}
             </div>
 
             <div className="px-4 py-2 rounded-full border border-purple-500/30 bg-purple-900/30 backdrop-blur-md font-bold text-xs tracking-wider shadow-lg text-purple-300">
@@ -1027,7 +228,7 @@ const GestureTree: React.FC = () => {
         `}
         >
              <div className="text-6xl font-black text-yellow-100 drop-shadow-[0_0_30px_rgba(255,215,0,0.8)] tracking-tighter mix-blend-screen">
-                 MERRY CHRISTMAS
+                 圣诞 快乐
              </div>
         </div>
 
